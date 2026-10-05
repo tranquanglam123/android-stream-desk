@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, nextTick, ref, watch, computed } from 'vue';
 import { useLayoutStore } from '../stores/layout';
+import { useConnectionStore } from '../stores/connection';
 import GridButton from './GridButton.vue';
 
 import { useSettingsStore } from '../stores/settings';
 import { playClick } from '../lib/clicksound';
 import type { DisplayFitMode } from '../stores/settings';
+import type { ButtonConfig } from '../types';
 
 const props = defineProps<{
   viewportKey?: number;
@@ -13,6 +15,7 @@ const props = defineProps<{
 
 const layoutStore = useLayoutStore();
 const settingsStore = useSettingsStore();
+const connectionStore = useConnectionStore();
 
 const fitMode = computed<DisplayFitMode>(() => settingsStore.displayFitMode);
 const isFullscreen = computed(() => fitMode.value === 'fullscreen');
@@ -29,7 +32,37 @@ watch(() => props.viewportKey, () => {
   });
 });
 
-function handlePress(button: Parameters<typeof layoutStore.pressButton>[0]) {
+// --- Per-key press feedback ---------------------------------------------
+// 'ok' is optimistic: the press reached the companion socket. 'error' comes
+// from the companion's own toast, correlated back to the key that was pressed
+// within ERROR_WINDOW_MS.
+const ACK_MS = 400;
+const ERROR_MS = 400;
+const ERROR_WINDOW_MS = 2000;
+
+const feedback = ref<Record<string, 'ok' | 'error'>>({});
+const feedbackTimers = new Map<string, number>();
+let lastPress: { id: string; at: number } | null = null;
+
+function setFeedback(id: string, kind: 'ok' | 'error', ms: number) {
+  const prev = feedbackTimers.get(id);
+  if (prev) clearTimeout(prev);
+  // Drop then re-add on the next frame so a repeated press replays the
+  // animation instead of the element staying mounted and static.
+  delete feedback.value[id];
+  requestAnimationFrame(() => {
+    feedback.value[id] = kind;
+    const timer = window.setTimeout(() => {
+      feedbackTimers.delete(id);
+      delete feedback.value[id];
+    }, ms);
+    feedbackTimers.set(id, timer);
+  });
+}
+
+// Fires on pointerdown so the finger gets haptic + click sound with no wait
+// for pointerup or the socket round-trip.
+function handlePressStart(button: ButtonConfig) {
   if (button.buttonKind === 'monitor') return;
 
   if (settingsStore.soundOnClick) {
@@ -41,9 +74,48 @@ function handlePress(button: Parameters<typeof layoutStore.pressButton>[0]) {
       navigator.vibrate(20);
     } catch (_) {}
   }
-
-  layoutStore.pressButton(button);
 }
+
+function handlePress(button: Parameters<typeof layoutStore.pressButton>[0]) {
+  if (button.buttonKind === 'monitor') return;
+
+  lastPress = { id: button.id, at: Date.now() };
+  layoutStore.pressButton(button);
+
+  // Only claim success when the socket is actually up; a queued press has not
+  // run anything yet, so no confirmation ring is shown for it.
+  if (connectionStore.status === 'connected') {
+    setFeedback(button.id, 'ok', ACK_MS);
+  }
+}
+
+watch(
+  () => layoutStore.lastToast,
+  (toast) => {
+    if (!toast || toast.kind !== 'error' || !lastPress) return;
+    if (Date.now() - lastPress.at > ERROR_WINDOW_MS) return;
+    setFeedback(lastPress.id, 'error', ERROR_MS);
+  }
+);
+
+// --- Page name flash -----------------------------------------------------
+const pageFlash = ref<string | null>(null);
+let pageFlashTimer = 0;
+
+watch(
+  () => layoutStore.currentPageIndex,
+  (idx) => {
+    const pages = layoutStore.layout.pages || [];
+    if (pages.length < 2) return;
+    const name = pages[idx]?.name?.trim();
+    if (!name) return;
+    pageFlash.value = name;
+    if (pageFlashTimer) clearTimeout(pageFlashTimer);
+    pageFlashTimer = window.setTimeout(() => {
+      pageFlash.value = null;
+    }, 1100);
+  }
+);
 
 function pageFromScroll(el: HTMLElement): number {
   if (el.clientWidth === 0) return layoutStore.currentPageIndex;
@@ -95,6 +167,9 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener('resize', onResize);
   if (rafId) cancelAnimationFrame(rafId);
+  feedbackTimers.forEach((t) => clearTimeout(t));
+  feedbackTimers.clear();
+  if (pageFlashTimer) clearTimeout(pageFlashTimer);
 });
 
 // Index changed by dot tap / action / Dashboard. Guard: skip scrollTo when the
@@ -216,12 +291,29 @@ watch(fitMode, () => {
                 :key="btn.id"
                 :button="btn"
                 :compact="isFullscreen || isCover"
+                instant-press
+                :feedback="feedback[btn.id]"
                 @press="handlePress"
+                @press-start="handlePressStart"
               />
             </div>
           </div>
         </div>
       </div>
+
+      <!-- Page name flash on swipe -->
+      <Transition name="page-flash">
+        <div
+          v-if="pageFlash"
+          class="page-flash absolute left-1/2 top-4 z-30 -translate-x-1/2 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.2em] pointer-events-none"
+          :style="{
+            color: 'var(--theme-accent, #06b6d4)',
+            borderColor: 'var(--theme-accent, #06b6d4)',
+          }"
+        >
+          {{ pageFlash }}
+        </div>
+      </Transition>
 
       <!-- Neon Dots Pagination (compact + offset for fullscreen bottom safe-area) -->
       <div
@@ -309,6 +401,27 @@ watch(fitMode, () => {
 :deep(.cyber-ghost) {
   opacity: 0.25;
   transition: opacity 0.15s;
+}
+
+.page-flash {
+  border: 1px solid;
+  border-radius: 9999px;
+  background: rgba(2, 6, 23, 0.72);
+  backdrop-filter: blur(6px);
+  text-shadow: 0 0 8px currentColor;
+}
+
+.page-flash-enter-active,
+.page-flash-leave-active {
+  transition:
+    opacity 0.22s ease,
+    transform 0.22s ease;
+}
+
+.page-flash-enter-from,
+.page-flash-leave-to {
+  opacity: 0;
+  transform: translate(-50%, -6px);
 }
 
 .theme-genshin-shell {

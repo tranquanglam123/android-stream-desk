@@ -4,8 +4,9 @@ import { storeToRefs } from 'pinia';
 import { useI18n } from 'vue-i18n';
 import { useConnectionStore } from '../stores/connection';
 import { useLayoutStore } from '../stores/layout';
-import { useSettingsStore } from '../stores/settings';
+import { useSettingsStore, IDLE_DIM_OPTIONS, type IdleDimSeconds } from '../stores/settings';
 import GridArea from '../components/GridArea.vue';
+import IdleDimOverlay from '../components/IdleDimOverlay.vue';
 import { Icon } from '@iconify/vue';
 import { acquireWakeLock, releaseWakeLock, isWakeLockActive } from '../lib/wakelock';
 import { unlockAudio } from '../lib/clicksound';
@@ -20,7 +21,7 @@ import {
 const connectionStore = useConnectionStore();
 const layoutStore = useLayoutStore();
 const settingsStore = useSettingsStore();
-const { keepScreenOn, vibrateOnClick, soundOnClick, displayFitMode } =
+const { keepScreenOn, vibrateOnClick, soundOnClick, displayFitMode, idleDimSeconds } =
   storeToRefs(settingsStore);
 
 const { t } = useI18n({
@@ -86,6 +87,10 @@ const { t } = useI18n({
           keepScreenOn: 'Keep Screen On',
           vibrateOnTap: 'Vibrate on Tap',
           soundOnTap: 'Sound on Tap',
+          idleDim: 'Dim When Idle',
+          idleDimOff: 'Off',
+          idleDimHint: 'The deck fades out after this gap; the first tap only wakes it.',
+          idleDimWake: 'Tap to wake',
           batteryHintPrefix: 'If WiFi disconnects while running on battery, go to',
           batteryPath: 'Settings → Apps → Battery → Unrestricted',
           batteryHintSuffix: 'to disable battery optimization for the app.',
@@ -157,6 +162,10 @@ const { t } = useI18n({
           keepScreenOn: 'Luôn bật màn hình',
           vibrateOnTap: 'Rung khi nhấn',
           soundOnTap: 'Âm thanh khi nhấn',
+          idleDim: 'Mờ màn hình khi rảnh',
+          idleDimOff: 'Tắt',
+          idleDimHint: 'Deck mờ dần sau khoảng này; chạm lần đầu chỉ để bật lại.',
+          idleDimWake: 'Chạm để bật lại',
           batteryHintPrefix: 'Nếu WiFi mất kết nối khi dùng pin, vào',
           batteryPath: 'Cài đặt → Ứng dụng → Pin → Không có hạn chế',
           batteryHintSuffix: 'để tắt tối ưu hóa pin cho app.',
@@ -285,6 +294,13 @@ const fitModeOptions = computed<{ value: FitModeLabel; label: string; icon: stri
 const setFitMode = (mode: FitModeLabel) => {
   displayFitMode.value = mode;
 };
+
+const idleDimOptions = computed<{ value: IdleDimSeconds; label: string }[]>(() =>
+  IDLE_DIM_OPTIONS.map((s) => ({
+    value: s,
+    label: s === 0 ? t('client.settings.idleDimOff') : s < 60 ? `${s}s` : `${s / 60}m`,
+  })),
+);
 
 // Android ActivityInfo.SCREEN_ORIENTATION_* values — passed to the native bridge.
 // `auto` uses SENSOR (4) not UNSPECIFIED (-1): several ROMs (LineageOS / POCO C40)
@@ -966,6 +982,43 @@ onUnmounted(() => {
               </p>
             </div>
 
+            <!-- Idle dim -->
+            <div
+              class="flex flex-col gap-2 rounded-xl bg-slate-950/60 px-3 py-2.5 border border-slate-850/60"
+            >
+              <div class="flex items-center gap-2">
+                <Icon icon="mdi:sleep" class="text-base text-slate-400" />
+                <span class="text-[10px] font-bold uppercase tracking-wider text-slate-300"
+                  >{{ t('client.settings.idleDim') }}</span
+                >
+              </div>
+              <div
+                class="grid grid-cols-5 gap-1.5"
+                role="radiogroup"
+                :aria-label="t('client.settings.idleDim')"
+              >
+                <button
+                  v-for="opt in idleDimOptions"
+                  :key="opt.value"
+                  type="button"
+                  role="radio"
+                  :aria-checked="idleDimSeconds === opt.value"
+                  @click="idleDimSeconds = opt.value"
+                  class="text-[10px] font-bold uppercase tracking-wider py-1.5 rounded-lg border transition duration-150 cursor-pointer"
+                  :class="
+                    idleDimSeconds === opt.value
+                      ? 'bg-violet-600 border-violet-500 text-white shadow shadow-violet-900/40'
+                      : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white hover:border-slate-700'
+                  "
+                >
+                  {{ opt.label }}
+                </button>
+              </div>
+              <p class="text-[9px] text-slate-500 leading-relaxed">
+                {{ t('client.settings.idleDimHint') }}
+              </p>
+            </div>
+
             <!-- Keep Screen On -->
             <div
               class="flex items-center justify-between rounded-xl bg-slate-950/60 px-3 py-2.5 border border-slate-850/60"
@@ -1106,5 +1159,12 @@ onUnmounted(() => {
         </button>
       </div>
     </Teleport>
+
+    <!-- Idle dim. Disabled while the QR scanner is up: the camera preview has
+         no pointer traffic and must not fade out under the user. -->
+    <IdleDimOverlay
+      :seconds="scanStatus === 'scanning' ? 0 : idleDimSeconds"
+      :hint="t('client.settings.idleDimWake')"
+    />
   </div>
 </template>

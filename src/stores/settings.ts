@@ -8,6 +8,26 @@ export const DISPLAY_FIT_MODES: DisplayFitMode[] = ['contain', 'cover', 'fullscr
 export const DEFAULT_FIT_MODE: DisplayFitMode = 'contain';
 const FIT_MODE_KEY = 'settings:displayFitMode';
 
+// 0 = never dim. Mirrors the "sleep" behaviour of hardware decks: the panel
+// fades out after an idle gap and the first tap only wakes it.
+export const IDLE_DIM_OPTIONS = [0, 30, 60, 120, 300] as const;
+export type IdleDimSeconds = (typeof IDLE_DIM_OPTIONS)[number];
+export const DEFAULT_IDLE_DIM: IdleDimSeconds = 60;
+const IDLE_DIM_KEY = 'settings:idleDimSeconds';
+
+export function parseIdleDim(raw: string | null | undefined): IdleDimSeconds {
+  // Guard before Number(): both null and '' coerce to 0, which is a *valid*
+  // option here ("never dim"), so an unset key would silently disable dimming.
+  if (raw === null || raw === undefined || raw.trim() === '') {
+    return DEFAULT_IDLE_DIM;
+  }
+  const n = Number(raw);
+  if ((IDLE_DIM_OPTIONS as readonly number[]).includes(n)) {
+    return n as IdleDimSeconds;
+  }
+  return DEFAULT_IDLE_DIM;
+}
+
 export function parseFitMode(raw: string | null | undefined): DisplayFitMode {
   if (raw && (DISPLAY_FIT_MODES as string[]).includes(raw)) {
     return raw as DisplayFitMode;
@@ -44,6 +64,12 @@ export const useSettingsStore = defineStore('settings', () => {
   const soundOnClick = ref<boolean>(initialSound);
   const displayFitMode = ref<DisplayFitMode>(readFitMode());
 
+  let initialIdleDim: IdleDimSeconds = DEFAULT_IDLE_DIM;
+  try {
+    initialIdleDim = parseIdleDim(localStorage.getItem(IDLE_DIM_KEY));
+  } catch (_) {}
+  const idleDimSeconds = ref<IdleDimSeconds>(initialIdleDim);
+
   watch(keepScreenOn, val => {
     localStorage.setItem('settings:keepScreenOn', JSON.stringify(val));
   });
@@ -62,5 +88,11 @@ export const useSettingsStore = defineStore('settings', () => {
     } catch (_) {}
   });
 
-  return { keepScreenOn, vibrateOnClick, soundOnClick, displayFitMode };
+  watch(idleDimSeconds, val => {
+    try {
+      localStorage.setItem(IDLE_DIM_KEY, String(val));
+    } catch (_) {}
+  });
+
+  return { keepScreenOn, vibrateOnClick, soundOnClick, displayFitMode, idleDimSeconds };
 });

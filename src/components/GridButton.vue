@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, onUnmounted, ref } from 'vue';
 import type { ButtonConfig } from '../types';
 import { Icon } from '@iconify/vue';
 import { hexToRgb, rgbToHsl } from '../lib/color';
@@ -12,10 +12,19 @@ const props = defineProps<{
   button: ButtonConfig;
   selected?: boolean;
   compact?: boolean;
+  // Device path: fire on pointer down/up instead of `click` so the key reacts
+  // under the finger with no wait for the browser's click synthesis.
+  instantPress?: boolean;
+  // Per-key result of the last press: 'ok' = sent to the companion,
+  // 'error' = the companion reported a failure.
+  feedback?: 'idle' | 'ok' | 'error';
 }>();
 
 const emit = defineEmits<{
   press: [button: ButtonConfig];
+  // Fires the instant the finger lands — host plays haptic/sound here so the
+  // feedback is not deferred to pointerup.
+  pressStart: [button: ButtonConfig];
 }>();
 
 const bgColor = computed(() => props.button.backgroundColor || '#1e293b');
@@ -96,7 +105,80 @@ const genshinFrameClass = computed(() => {
   return `genshin-frame-${frame}`;
 });
 
+// --- Instant press (device) ---------------------------------------------
+// A press that starts on a key but turns into a horizontal page swipe must not
+// fire the macro, so the pointer is tracked and cancelled past MOVE_CANCEL_PX.
+const MOVE_CANCEL_PX = 12;
+const RIPPLE_MS = 500;
+
+const pressing = ref(false);
+const ripples = ref<{ id: number; x: number; y: number }[]>([]);
+const rippleTimers = new Set<number>();
+
+let rippleSeq = 0;
+let activePointerId: number | null = null;
+let startX = 0;
+let startY = 0;
+let cancelled = false;
+
+function spawnRipple(x: number, y: number) {
+  const id = ++rippleSeq;
+  ripples.value.push({ id, x, y });
+  const timer = window.setTimeout(() => {
+    rippleTimers.delete(timer);
+    ripples.value = ripples.value.filter((r) => r.id !== id);
+  }, RIPPLE_MS);
+  rippleTimers.add(timer);
+}
+
+function endPointer() {
+  activePointerId = null;
+  pressing.value = false;
+}
+
+function onPointerDown(e: PointerEvent) {
+  if (!props.instantPress || isMonitor.value) return;
+  // Ignore a second finger landing on the same key mid-press.
+  if (activePointerId !== null) return;
+  activePointerId = e.pointerId;
+  cancelled = false;
+  pressing.value = true;
+  startX = e.clientX;
+  startY = e.clientY;
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+  spawnRipple(e.clientX - rect.left, e.clientY - rect.top);
+  emit('pressStart', props.button);
+}
+
+function onPointerMove(e: PointerEvent) {
+  if (activePointerId !== e.pointerId || cancelled) return;
+  if (Math.hypot(e.clientX - startX, e.clientY - startY) > MOVE_CANCEL_PX) {
+    cancelled = true;
+    pressing.value = false;
+  }
+}
+
+function onPointerUp(e: PointerEvent) {
+  if (activePointerId !== e.pointerId) return;
+  endPointer();
+  if (cancelled) return;
+  emit('press', props.button);
+}
+
+function onPointerCancel(e: PointerEvent) {
+  if (activePointerId !== e.pointerId) return;
+  cancelled = true;
+  endPointer();
+}
+
+onUnmounted(() => {
+  rippleTimers.forEach((t) => clearTimeout(t));
+  rippleTimers.clear();
+});
+
 function handleClick() {
+  // Instant path already emitted on pointerup; the synthetic click would double-fire.
+  if (props.instantPress) return;
   emit('press', props.button);
 }
 </script>
@@ -104,12 +186,18 @@ function handleClick() {
 <template>
   <button
     @click="handleClick"
+    @pointerdown="onPointerDown"
+    @pointermove="onPointerMove"
+    @pointerup="onPointerUp"
+    @pointercancel="onPointerCancel"
     class="cyber-btn group relative w-full h-full min-w-0 min-h-0 flex flex-col items-center justify-center cursor-pointer select-none overflow-hidden transition-all duration-150 ease-out"
     :class="{
       'gap-1 p-1.5': !compact && !isMonitor,
       'gap-0.5 p-1': compact && !isMonitor,
       'cyber-btn--selected': selected,
       'cyber-btn--monitor': isMonitor,
+      'cyber-btn--pressing': pressing,
+      'cyber-btn--error': feedback === 'error',
       'theme-genshin-btn': layoutStore.layout.theme === 'genshin-01',
       [genshinFrameClass]: layoutStore.layout.theme === 'genshin-01',
     }"
@@ -118,7 +206,12 @@ function handleClick() {
       '--neon-glow': neonGlow,
       backgroundColor:
         layoutStore.layout.theme === 'genshin-01' ? 'transparent' : 'var(--theme-btn-bg)',
-      borderColor: layoutStore.layout.theme === 'genshin-01' ? 'transparent' : neonColor,
+      borderColor:
+        feedback === 'error'
+          ? '#ef4444'
+          : layoutStore.layout.theme === 'genshin-01'
+            ? 'transparent'
+            : neonColor,
       boxShadow:
         layoutStore.layout.theme === 'genshin-01'
           ? 'none'
@@ -127,6 +220,21 @@ function handleClick() {
             : `0 0 5px 1px ${neonGlow}, 0 0 12px 1px ${neonGlow.replace('0.5)', '0.15)')}`,
     }"
   >
+    <!-- Touch ripple, spawned at the finger position on pointerdown -->
+    <span
+      v-for="r in ripples"
+      :key="r.id"
+      class="press-ripple absolute z-20 pointer-events-none"
+      :style="{ left: `${r.x}px`, top: `${r.y}px`, backgroundColor: neonGlow }"
+    />
+
+    <!-- Press result: one expanding ring, neon on success, red on failure -->
+    <span
+      v-if="feedback && feedback !== 'idle'"
+      class="ack-ring absolute inset-0 z-20 border-2 pointer-events-none"
+      :style="{ borderColor: feedback === 'error' ? '#ef4444' : neonColor }"
+    />
+
     <!-- Monitor display -->
     <template v-if="isMonitor">
       <div
@@ -346,6 +454,10 @@ function handleClick() {
   border-radius: var(--theme-btn-radius);
   clip-path: var(--theme-clip-path);
   font-family: var(--theme-font-family);
+  /* `manipulation` keeps page swipe/pinch but drops the double-tap delay, and
+     the tap highlight would fight the ripple. */
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
 }
 
 @media (hover: hover) {
@@ -364,6 +476,86 @@ function handleClick() {
   box-shadow:
     inset 0 0 30px 4px var(--neon-glow),
     0 0 20px 3px var(--neon-glow);
+}
+
+/* Held under the finger: deeper than :active so the state survives a pointer
+   that drifts a few px without leaving the key. */
+.cyber-btn--pressing {
+  transform: scale(0.93);
+  filter: brightness(1.25);
+  box-shadow:
+    inset 0 0 34px 6px var(--neon-glow),
+    0 0 24px 4px var(--neon-glow) !important;
+}
+
+.press-ripple {
+  width: 0;
+  height: 0;
+  border-radius: 9999px;
+  opacity: 0.55;
+  transform: translate(-50%, -50%);
+  animation: ripple-out 0.5s cubic-bezier(0.22, 0.61, 0.36, 1) forwards;
+}
+
+@keyframes ripple-out {
+  0% {
+    width: 0;
+    height: 0;
+    opacity: 0.55;
+  }
+  100% {
+    width: 240%;
+    height: 240%;
+    opacity: 0;
+  }
+}
+
+.ack-ring {
+  border-radius: var(--theme-btn-radius);
+  animation: ack-ring-out 0.4s ease-out forwards;
+}
+
+@keyframes ack-ring-out {
+  0% {
+    transform: scale(0.82);
+    opacity: 0.9;
+  }
+  100% {
+    transform: scale(1.08);
+    opacity: 0;
+  }
+}
+
+/* Companion rejected the action: short lateral shake, no layout shift. */
+.cyber-btn--error {
+  animation: key-shake 0.4s cubic-bezier(0.36, 0.07, 0.19, 0.97);
+}
+
+@keyframes key-shake {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  20% {
+    transform: translateX(-4px);
+  }
+  40% {
+    transform: translateX(4px);
+  }
+  60% {
+    transform: translateX(-3px);
+  }
+  80% {
+    transform: translateX(2px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .press-ripple,
+  .ack-ring,
+  .cyber-btn--error {
+    animation-duration: 0.01ms;
+  }
 }
 
 .cyber-btn--selected {
